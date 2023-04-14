@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+
+
 class BaseError(Exception):
     """
     Base for all Orchestra API Errors.

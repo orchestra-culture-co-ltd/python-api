@@ -1,5 +1,5 @@
-# Copyright (c) 2019-2021, Orchestra Culture Co., ltd. All rights reserved.
-
+# -*- coding: utf-8 -*-
+# Copyright (c) 2019-2023, 北京遨奇思特文化有限责任公司, alternate name Orchestra Culture Co., ltd. All rights reserved.
 
 import sys
 import os
@@ -8,22 +8,25 @@ import time
 import math
 import random
 import ssl
-import urllib.request
-import http.cookiejar
 import pytz
 import certifi
 import urllib3
 import json
 import logging
+import yaml
 
 from typing import List
-from datetime import datetime, timedelta, timezone
+from future.types.newbytes import newbytes
+from datetime import datetime, timedelta
 from collections import OrderedDict
 from urllib3._collections import HTTPHeaderDict
-from urllib.parse import urlunsplit
+from urllib3.util.url import parse_url
+
+from six.moves import urllib, http_cookiejar, http_client
 
 from . import exceptions
 from .utils import (
+    patch,
     _parse_iso8601_string,
     _md5sum_hash,
     _sha256_hash,
@@ -33,8 +36,20 @@ from .utils import (
     _generate_headers,
 )
 
+patch()
 
-__VERSION__ = "0.0.3"
+
+if sys.version_info[0] > 2:
+    from datetime import timezone
+    urllib_support_method = True
+
+else:
+    from pytz import timezone, utc
+    timezone.utc = utc
+    urllib_support_method = False
+
+
+__VERSION__ = "0.0.4"
 
 
 REQUEST_TIMEOUT = 10
@@ -42,12 +57,17 @@ POLLING_INTERVAL = 2
 CSRF_MIDDLEWARE_TOKEN_NAME = "csrfmiddlewaretoken"
 CSRF_TOKEN_NAME = "csrftoken"
 X_CSRFTOKEN_NAME = "X-CSRFToken"
+SESSION_ID_NAME = "sessionid"
+try:
+    OPENSSL_VERSION = ssl.OPENSSL_VERSION
+except:
+    OPENSSL_VERSION = "not found"
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0",
     "orchestra-api (%s)" % __VERSION__,
-    "Python %s (%s)" % (".".join(
+    "Python %s (%s)" % (os.path.extsep.join(
         str(x) for x in sys.version_info[:3]), sys.platform.lower().capitalize()),
-    "ssl %s (%s)" % (ssl.OPENSSL_VERSION, "no-validate")
+    "ssl %s (%s)" % (OPENSSL_VERSION, "no-validate")
 ]
 
 
@@ -56,7 +76,7 @@ __LOG__.setLevel(logging.WARN)
 
 
 class Api(object):
-    def __init__(self, site_url, email=None, password=None, api_key=None, proxy=None, sessionid=None):
+    def __init__(self, site_url, email=None, password=None, api_key=None, proxy=None, sessionid=None, csrftoken=None):
         """
         :param site_url: format like http://trial.orchestra-technology.com
         :param email: api user should also login with email.
@@ -78,22 +98,29 @@ class Api(object):
         self.proxy = proxy
         self.sessionid = sessionid
 
-        if self.api_key and not self.password:
+        self._credentials = {}
+
+        if self.email and self.api_key:
             self._credentials = {
                 "email": self.email,
                 "api_key": self.api_key
             }
-        else:
+        elif self.email and self.password:
             self._credentials = {
                 "email": self.email,
                 "password": self.password
             }
+        elif self.sessionid:
+            self._credentials = {
+                "sessionid": self.sessionid
+            }
+            if csrftoken:
+                self._credentials["csrftoken"] = csrftoken
 
         self._s3_credentials = {}
 
         # TODO: validate input arguments like site_url, email, proxy, etc.
         self.install_opener()
-        self.cache_csrftoken()
 
     def build_opener(self, *handlers):
         _handlers = []
@@ -111,13 +138,14 @@ class Api(object):
         return urllib.request.build_opener(*_handlers)
 
     def install_opener(self):
-        cookiejar = http.cookiejar.CookieJar()
+        cookiejar = http_cookiejar.CookieJar()
         port_spec = True if self.port else False
-        cookie = http.cookiejar.Cookie("0", "language", "zh-hans", self.port, port_spec, self.domain, False,
+        cookie = http_cookiejar.Cookie("0", "language", "zh-hans", self.port, port_spec, self.domain, False,
                                        False, "/", True, False, None, False, None, None, {})
         cookiejar.set_cookie(cookie)
         cookie_handler = urllib.request.HTTPCookieProcessor(cookiejar)
-        opener = self.build_opener(cookie_handler)
+        # in py26/27, _opener is not exited.
+        urllib.request._opener = opener = self.build_opener(cookie_handler)
         urllib.request.install_opener(opener)
 
     def find_cookiejar(self, ):
@@ -127,6 +155,26 @@ class Api(object):
             if isinstance(handler, urllib.request.HTTPCookieProcessor):
                 return handler.cookiejar
         return None
+
+    def save_session(self, yml_path):
+        """
+        Only save CSRF_TOKEN_NAME, SESSION_ID_NAME
+
+        Api module has logout method so session will not always valid.
+        """
+        with open(yml_path, "w+") as f:
+            data = []
+            self.find_cookiejar()
+            cookiejar = self.find_cookiejar() or []
+
+            for item in cookiejar:
+                if item.name in [CSRF_TOKEN_NAME, SESSION_ID_NAME]:
+                    data.append({
+                        "name": item.name,
+                        "value": item.value,
+                        "expired": item.expires})
+
+            yaml.dump(data, f)
 
     def get_cached_csrftoken(self, ):
         cookiejar = self.find_cookiejar()
@@ -155,14 +203,17 @@ class Api(object):
             "Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
         request.add_header("Content-Length", len(request.data)
                            if request.data else 0)
-        request.add_header("Sec-Fetch-Dest", 'empty',)
-        request.add_header("Sec-Fetch-Mode", 'cors',)
+        request.add_header("Sec-Fetch-Dest", "empty",)
+        request.add_header("Sec-Fetch-Mode", "cors",)
         request.add_header("Sec-Fetch-Site", "same-origin",)
-        request.add_header("X-Requested-With", 'XMLHttpRequest')
+        request.add_header("X-Requested-With", "XMLHttpRequest")
         request.add_header("Referer", self.site_url)
 
     def get_login_url(self):
         return urllib.parse.urljoin(self.site_url, "user/login")
+
+    def get_logout_url(self):
+        return urllib.parse.urljoin(self.site_url, "user/logout")
 
     def get_api_url(self):
         return urllib.parse.urljoin(self.site_url, "crud/requests")
@@ -181,14 +232,17 @@ class Api(object):
 
     # GET CSRFTOKEN.
     def cache_csrftoken(self):
-        request = urllib.request.Request(self.get_csrf_url(), method="GET")
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "GET"
+        request = urllib.request.Request(self.get_csrf_url(), **kwargs)
         self.add_general_header(request)
 
         try:
             response = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
 
         except urllib.error.HTTPError as e:
-            __LOG__.debug('HTTPError', e.code, e.read())
+            __LOG__.debug("HTTPError", e.code, e.read())
             raise e
 
         except urllib.error.URLError as e:
@@ -207,7 +261,7 @@ class Api(object):
                 expires = int(time.time()) + int(expires)
 
             port_spec = True if self.port else False
-            cookie = http.cookiejar.Cookie("0", CSRF_TOKEN_NAME, csrftoken, self.port, port_spec, self.domain, False,
+            cookie = http_cookiejar.Cookie("0", CSRF_TOKEN_NAME, csrftoken, self.port, port_spec, self.domain, False,
                                            False, path, True, False, expires, True, None, None, {})
 
             cookiejar = self.find_cookiejar()
@@ -220,17 +274,48 @@ class Api(object):
         LOGIN.
         Cache sessionid in CookieJar.
         """
-        content_string = urllib.parse.urlencode(self._credentials)
-        content_string = bytes(content_string, encoding='utf8')
+        self.cache_csrftoken()
 
+        content_string = urllib.parse.urlencode(self._credentials)
+        content_string = newbytes(content_string, encoding="utf-8")
+
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
         request = urllib.request.Request(
-            self.get_login_url(), data=content_string, method="POST")
+            self.get_login_url(), data=content_string, **kwargs)
         self.add_x_csrftoken_header(request)
+
+        return self._send_authenticate_request(request)
+
+    def log_out(self):
+        """
+        Log out.
+        """
+        request = urllib.request.Request(
+            self.get_logout_url())
+
+        try:
+            urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
+
+        except urllib.error.HTTPError as e:
+            __LOG__.debug("HTTPError", e.code, e.read())
+            raise e
+
+        except urllib.error.URLError as e:
+            __LOG__.debug("URLError", e.reason)
+            raise e
+
+        else:
+            # urllib.request will cache sessionid automatically.
+            return True
+
+    def _send_authenticate_request(self, request):
         self.add_general_header(request)
 
         try:
             resp = urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
-            
+
             # NOTE: url changed means login success.
             splitResult = urllib.parse.urlsplit(self.get_login_url())
             splitResultLater = urllib.parse.urlsplit(resp.geturl())
@@ -241,7 +326,7 @@ class Api(object):
                 return True
 
         except urllib.error.HTTPError as e:
-            __LOG__.debug('HTTPError', e.code, e.read())
+            __LOG__.debug("HTTPError", e.code, e.read())
             raise e
 
         except urllib.error.URLError as e:
@@ -251,6 +336,35 @@ class Api(object):
         else:
             # urllib.request will cache sessionid automatically.
             return True
+
+    def connect(self):
+        port_spec = True if self.port else False
+        cookiejar = self.find_cookiejar()
+
+        csrftoken = self._credentials.get(CSRF_TOKEN_NAME)
+        if csrftoken:
+            cookiejar.set_cookie(
+                http_cookiejar.Cookie("0", CSRF_TOKEN_NAME, csrftoken, self.port, port_spec, self.domain, False,
+                                      False, "/",  True, False, None, True, None, None, {})
+            )
+        else:
+            self.cache_csrftoken()
+
+        sessionid = self._credentials.get(SESSION_ID_NAME)
+        cookiejar.set_cookie(
+            http_cookiejar.Cookie("0", SESSION_ID_NAME, sessionid, self.port, port_spec, self.domain, False,
+                                  False, "/",  True, False, None, True, None, None, {})
+        )
+
+        return True
+
+    def is_valid(self):
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "GET"
+        request = urllib.request.Request(self.get_login_url(), **kwargs)
+
+        return self._send_authenticate_request(request)
 
     def set_async_mode(self, async_mode=False):
         """
@@ -263,6 +377,8 @@ class Api(object):
 
     @property
     def schema(self):
+        if self._schema and "global" in self._schema:
+            return self._schema["global"]
         return self._schema
 
     @schema.setter
@@ -272,7 +388,13 @@ class Api(object):
 
     def read_schema_md5(self):
         url = urllib.parse.urljoin(self.get_schema_url() + "/", "md5")
-        request = urllib.request.Request(url, method="POST")
+
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
+        else:
+            kwargs["data"] = self.encode_payload({})
+        request = urllib.request.Request(url, **kwargs)
         self.add_x_csrftoken_header(request)
         self.add_general_header(request)
         response = self._http_request(request)
@@ -297,7 +419,7 @@ class Api(object):
             md5 = self.read_schema_md5()
             if md5 == False:
                 refresh = True
-            elif self.schema and self.schema["md5"] != md5:
+            elif self.schema and self._schema["md5"] != md5:
                 refresh = True
 
         return self.load_schema(refresh)
@@ -307,7 +429,12 @@ class Api(object):
         if refresh:
             url = urllib.parse.urljoin(self.get_schema_url() + "/", "reload")
 
-        request = urllib.request.Request(url, method="POST")
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
+        else:
+            kwargs["data"] = self.encode_payload({})
+        request = urllib.request.Request(url, **kwargs)
         self.add_x_csrftoken_header(request)
         self.add_general_header(request)
         response = self._http_request(request)
@@ -351,7 +478,7 @@ class Api(object):
         :param has_versions             : option
         :returns                        : async task id.
         """
-        entity_type = 'EntityType'
+        entity_type = "EntityType"
         data = [{
             "name": name,
             "help": help,
@@ -372,7 +499,8 @@ class Api(object):
         self.set_async_mode(False)
         return task_id
 
-    def _request_schema(self, request_type, entity_type, data: List[dict]):
+    def _request_schema(self, request_type, entity_type, data):
+        # type: (str, str, List[dict]) -> str
         assert isinstance(data, list), "data should be list."
         assert data, "data should not be empty."
         assert entity_type in [
@@ -386,7 +514,8 @@ class Api(object):
         self.set_async_mode(False)
         return task_id
 
-    def create_entity_type(self, data: List[dict]):
+    def create_entity_type(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Create specified entity type.
@@ -402,7 +531,8 @@ class Api(object):
                    ), "item in data should has 'name' attribute."
         return self._request_schema("create", "EntityType", data)
 
-    def update_entity_type(self, data: List[dict]):
+    def update_entity_type(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Update specified entity type.
@@ -418,7 +548,8 @@ class Api(object):
                    ), "item in data should has 'id' or 'name' attribute."
         return self._request_schema("update", "EntityType", data)
 
-    def delete_entity_type(self, data: List[dict]):
+    def delete_entity_type(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Update specified entity type.
@@ -433,7 +564,8 @@ class Api(object):
                    ), "item in data should has 'id' attribute."
         return self._request_schema("delete", "EntityType", data)
 
-    def create_field(self, data: List[dict]):
+    def create_field(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Create specified field.
@@ -449,7 +581,8 @@ class Api(object):
                    ), "item in data should has 'entity_type', 'name' and 'data_type."
         return self._request_schema("create", "Field", data)
 
-    def update_field(self, data: List[dict]):
+    def update_field(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Update specified field.
@@ -465,7 +598,8 @@ class Api(object):
                    ), "item in data should has either 'entity_type' & 'name' or 'id."
         return self._request_schema("update", "Field", data)
 
-    def delete_field(self, data: List[dict]):
+    def delete_field(self, data):
+        # type: (List[dict]) -> str
         """
         Async Request.
         Delete specified field.
@@ -485,7 +619,7 @@ class Api(object):
 
         Example:
             api.read("Task",
-                fields=[["id", "name", "status"]],
+                fields=["id", "name", "status"],
                 filters=["project", "is", {"id": 1, "type": "Project"}],
                 sorts=[{ "column": "name", "direction": "ASC" }],
                 groups=[
@@ -523,7 +657,8 @@ class Api(object):
         else:
             return data
 
-    def create(self, entity_type, data: List[dict]):
+    def create(self, entity_type, data):
+        # type: (str, List[dict]) -> list or dict
         """
         Create specified entities.
 
@@ -537,7 +672,7 @@ class Api(object):
         :param local_timezone_offset: ignore
         :param storeId              : ignore
         """
-        payload = self.build_payload('create', entity_type, None, data)
+        payload = self.build_payload("create", entity_type, None, data)
         try:
             data = self._send_request(payload)
         except:
@@ -545,7 +680,8 @@ class Api(object):
         else:
             return data
 
-    def update(self, entity_type, data: List[dict]):
+    def update(self, entity_type, data):
+        # type: (str, List[dict]) -> list or dict
         """
         Update specified entities.
 
@@ -561,7 +697,7 @@ class Api(object):
         :param local_timezone_offset: ignore
         :param storeId              : ignore
         """
-        payload = self.build_payload('update', entity_type, None, data)
+        payload = self.build_payload("update", entity_type, None, data)
         try:
             data = self._send_request(payload)
         except:
@@ -583,7 +719,7 @@ class Api(object):
         :param local_timezone_offset: ignore
         :param storeId              : ignore
         """
-        payload = self.build_payload('delete', entity_type, None, data)
+        payload = self.build_payload("delete", entity_type, None, data)
         try:
             data = self._send_request(payload)
         except:
@@ -610,12 +746,38 @@ class Api(object):
         """
         return
 
-    def resolve_async_task(self, task_id):
+    def find_project(self, entity):
+        """
+        request_type: "find_project",
+        entity_type: "Project",
+        data: [entity],
+        columns: [
+            "id",
+            "code",
+            "name",
+            "description",
+            "status",
+            "project_type",
+        ],
+        local_timezone_offset:
+            Orch.util.reduxStore.getState().preference
+                .localization.timezone,
+        """
+        payload = self.build_payload("find_project", "Project", [
+                                     "id", "code"], [entity])
+        try:
+            data = self._send_request(payload)
+        except:
+            raise
+        else:
+            return data
+
+    def solve_async_task(self, task_id):
         """
         Resolve task result from server.
 
         Example:
-            api.resolve_async_task(task_id)
+            api.solve_async_task(task_id)
 
         :param task_id: task id returned by server.
 
@@ -631,7 +793,7 @@ class Api(object):
         Polling task result from server until it finished.
 
         Example:
-            api.resolve_async_task(task_id)
+            api.solve_async_task(task_id)
 
         :param task_id: task id returned by server.
 
@@ -694,7 +856,8 @@ class Api(object):
         """
         return ["is", "is_not", "less_than", "greater_than", "contains", "excludes", "in", "not_in", "starts_with", "ends_with"]
 
-    def process_filters(self, filters: list):
+    def process_filters(self, filters):
+        # type: (list, ) -> dict
         """
         Convert list to dict which server can recognize.
 
@@ -787,7 +950,7 @@ class Api(object):
             "values": filters[2] if isinstance(filters[2], list) else [filters[2]]
         }
 
-        # process ['name', 'is', 'Layout'] instead of [['name', 'is', 'Layout']].
+        # process ["name", "is", "Layout"] instead of [["name", "is", "Layout"]].
         if inject == 0:
             condition = {
                 "operator": operator,
@@ -814,11 +977,14 @@ class Api(object):
 
     def encode_payload(self, payload):
         payload_encoded = urllib.parse.urlencode(payload)
-        return bytes(payload_encoded, encoding='utf-8')
+        return newbytes(payload_encoded, encoding="utf-8")
 
     def decode_payload(self, response):
         string = response.read()
-        return json.loads(string.decode())
+        try:
+            return json.loads(string.decode())
+        except:
+            raise Exception(string.decode())
 
     def get_rows(self, payload):
         """
@@ -831,7 +997,8 @@ class Api(object):
             return rows[0]
         return rows
 
-    def group_by(self, payload: dict):
+    def group_by(self, payload):
+        # type: (dict,) -> list
         grouped_rows = []
         rows = self.get_rows(payload)
         groups = payload.get("groups")
@@ -847,12 +1014,16 @@ class Api(object):
             grouped_rows.append(new_group)
         return grouped_rows
 
-    def _build_async_task_request(self, payload: dict):
+    def _build_async_task_request(self, payload):
+        # type: (dict,) -> urllib.request.Request
         payload_string = json.dumps(payload)
-        payload_encoded = bytes(payload_string, encoding='utf-8')
+        payload_encoded = newbytes(payload_string, encoding="utf-8")
 
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
         request = urllib.request.Request(
-            self.get_async_task_url(), data=payload_encoded, method="POST")
+            self.get_async_task_url(), data=payload_encoded, **kwargs)
         self.add_x_csrftoken_header(request)
         self.add_general_header(request)
 
@@ -862,14 +1033,18 @@ class Api(object):
         payload = self.process_payload(payload)
         payload_encoded = self.encode_payload(payload)
 
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
         request = urllib.request.Request(
-            self.get_api_url(), data=payload_encoded, method="POST")
+            self.get_api_url(), data=payload_encoded, **kwargs)
         self.add_x_csrftoken_header(request)
         self.add_general_header(request)
 
         return request
 
-    def _http_request(self, request: urllib.request.Request):
+    def _http_request(self, request):
+        # type: (urllib.request.Request,) -> http_client.HTTPResponse
         try:
             return urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
 
@@ -877,27 +1052,40 @@ class Api(object):
             return self._process_http_error(e)
 
         except urllib.error.URLError as e:
-            __LOG__.debug('URLError', e.reason)
+            __LOG__.debug("URLError", e.reason)
             raise e
 
-    def _polling_http_request(self, request: urllib.request.Request):
+    def _polling_http_request(self, request):
+        # type: (urllib.request.Request,) -> http_client.HTTPResponse
+        running = True
         response = None
 
-        def _is_async_task_running(request):
-            nonlocal response
-            response = self._http_request(request)
+        while running:
             __LOG__.debug("Polling...")
-            return response.status == 202
-
-        while _is_async_task_running(request):
+            response = self._http_request(request)
+            running = response.status == 202
             time.sleep(POLLING_INTERVAL)
 
         return response
 
-    def _send_request(self, payload: List[dict]):
+    def _send_request(self, payload, multi=False):
+        """
+        send single or a boundle of request.
+
+        Args:
+            payload (List[dict]): _description_
+            multi (bool, optional): _description_. Defaults to False.
+
+        Returns:
+            list or dict:   You know payload inclues multiple rows.
+                            if multi is False, page_size is 1, return single row dictionary.
+                            if multi is False, page_size is larger that 1, return multiple rows list.
+                            if multi is True, page_size is 1, return rows list, row is dictionary.
+                            if multi is True, page_size is larger that 1, return payloads list, each of payload includes a rows list.
+        """
         request = self._build_crud_request(payload)
         response = self._http_request(request)
-        return self._process_response(response)
+        return self._process_response(response, multi=multi)
 
     def _process_request(self):
         """
@@ -905,39 +1093,47 @@ class Api(object):
         """
         return
 
-    def _process_response(self, response):
+    def _process_response(self, response, multi=False):
         """
         TODO: lock async_mode in period between request and response.
         """
         payload = self.decode_payload(response)
 
         if self.get_async_mode():
-            return self._processs_async_payload(payload)
+            return self._processs_async_payload(payload, multi=multi)
 
-        return self._extract_payload(payload)
+        return self._extract_payloads(payload, multi=multi)
 
-    def _process_async_task_response(self, response):
+    def _process_async_task_response(self, response, multi=False):
         payload = self.decode_payload(response)
         if not payload["success"]:
-            msg = payload.get('message')
+            msg = payload.get("message")
             raise exceptions.RequestFailed(
                 "Request Failed: " + self._extract_message(msg))
 
         task_payload = payload["data"]
-        return self._extract_payload(task_payload)
+        return self._extract_payloads(task_payload, multi=multi)
+
+    def _extract_payloads(self, payloads, multi=False):
+        # hard code by multi argument.
+        # actually we should extract every items in payload.
+
+        ret = []
+        if not multi:
+            return self._extract_payload(payloads[0])
+        else:
+            for payload in payloads:
+                ret.append(self._extract_payload(payload))
+        return ret
 
     def _extract_payload(self, payload):
-        # hard code
-        # actually we should extract every items in payload.
-        payload = payload[0]
-
         if payload:
             if payload["success"]:
                 if payload.get("groups"):
                     return self.group_by(payload)
                 return self.get_rows(payload)
             else:
-                msg = payload.get('message')
+                msg = payload.get("message")
                 raise exceptions.RequestFailed(
                     "Request Failed: " + self._extract_message(msg))
         raise exceptions.UnknownError(
@@ -946,7 +1142,7 @@ class Api(object):
     def _processs_async_payload(self, payload):
         if payload["success"]:
             return payload["task_id"]
-        msg = payload.get('message')
+        msg = payload.get("message")
         raise exceptions.RequestFailed(
             "Request Failed: " + self._extract_message(msg))
 
@@ -955,7 +1151,7 @@ class Api(object):
         TODO
         """
         payload = self.decode_payload(http_error)
-        __LOG__.debug('HTTPError', payload)
+        __LOG__.debug("HTTPError", payload)
 
         if isinstance(payload, list):
             payload = payload[0]
@@ -985,7 +1181,8 @@ class Api(object):
 
         :param path   : file path.
         :param url    : url behind bucket name, it can be relative path like 'project/sequence/shot/task/version/mov/sample.mov'.
-        :param entity : link to generated attachment: {'id': 1, 'type': 'Version'}.
+                        you'd better convert it to md5 string with crypto and uuid module to keep string unique.
+        :param list   : link to generated attachment: {'id': 1, 'type': 'Version'}.
         :returns      : async task id.
         """
         try:
@@ -1000,25 +1197,25 @@ class Api(object):
         _, file_extension = os.path.splitext(path)
         file_extension = file_extension.lower()
         file_size = os.stat(path).st_size
+        attachment_links = [entity] if entity else []
 
         attachments = self.create("Attachment", data=[{
-            'this_file': url,
-            'filename': filename,
-            'display_name': display_name,
-            'original_fname': original_fname,
-            'file_extension': file_extension,
-            'file_size': file_size,
-            'thumbnail': '',  # TODO
-            'status': "act",
-            'project': project,
-            'attachment_type': "cloud"}])
-        attachment = attachments[0]
-        attachment["type"] = "Attachment"
-        if entity:
-            self.create("AttachmentLink", data=[{
-                'attachment': attachment,
-                'entity': entity}])
-        return attachment
+            "this_file": url,
+            "filename": filename,
+            "display_name": display_name,
+            "original_fname": original_fname,
+            "file_extension": file_extension,
+            "file_size": file_size,
+            "thumbnail": "",  # TODO
+            "status": "act",
+            "project": project,
+            "attachment_type": "cloud",
+            "attachment_links": attachment_links}])
+
+        # attachment = attachments[0]
+        # attachment["type"] = "Attachment"
+
+        return attachments[0]
 
     def enable_s3(self):
         if self._is_s3_expired():
@@ -1029,8 +1226,13 @@ class Api(object):
 
         :returns    : credential dictionary.
         """
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
+        else:
+            kwargs["data"] = self.encode_payload({})
         request = urllib.request.Request(
-            self.get_ack_url(), method="POST")
+            self.get_ack_url(), **kwargs)
         self.add_x_csrftoken_header(request)
         self.add_general_header(request)
 
@@ -1040,28 +1242,74 @@ class Api(object):
         return payload
 
     def _setup_s3_client(self, data):
-        self._s3_credentials["EndPoint"] = data["EndPoint"]
-        self._s3_credentials["Secure"] = data["Secure"]
-        self._s3_credentials["Bucket"] = data["Bucket"]
-        self._s3_credentials["Region"] = data["Region"]
-        self._s3_credentials["AccessKeyId"] = data["ack"]["AccessKeyId"]
-        self._s3_credentials["SecretAccessKey"] = data["ack"]["SecretAccessKey"]
-        self._s3_credentials["SessionToken"] = data["ack"]["SessionToken"]
-        # utc time.
-        self._s3_credentials["Expiration"] = data["ack"]["Expiration"]
+        if sys.version_info[0] > 2:
+            self._s3_credentials["EndPoint"] = data["EndPoint"]
+            self._s3_credentials["Secure"] = data["Secure"]
+            self._s3_credentials["Bucket"] = data["Bucket"]
+            self._s3_credentials["Region"] = data["Region"]
+            self._s3_credentials["AccessKeyId"] = data["ack"]["AccessKeyId"]
+            self._s3_credentials["SecretAccessKey"] = data["ack"]["SecretAccessKey"]
+            self._s3_credentials["SessionToken"] = data["ack"]["SessionToken"]
+            # utc time.
+            self._s3_credentials["Expiration"] = data["ack"]["Expiration"]
+        else:
+            # NOTE: In Python2: Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
+            #                   Here I convert all argument to utf8 string explicitly.
+            self._s3_credentials["EndPoint"] = data["EndPoint"].encode()
+            self._s3_credentials["Secure"] = data["Secure"]
+            self._s3_credentials["Bucket"] = data["Bucket"].encode()
+            self._s3_credentials["Region"] = data["Region"].encode()
+            self._s3_credentials["AccessKeyId"] = data["ack"]["AccessKeyId"].encode(
+            )
+            self._s3_credentials["SecretAccessKey"] = data["ack"]["SecretAccessKey"].encode(
+            )
+            self._s3_credentials["SessionToken"] = data["ack"]["SessionToken"].encode(
+            )
+            # utc time.
+            self._s3_credentials["Expiration"] = data["ack"]["Expiration"].encode(
+            )
 
         timeout = timedelta(minutes=1).seconds
-        self._s3_client = urllib3.PoolManager(
-            timeout=urllib3.util.Timeout(connect=timeout, read=timeout),
-            maxsize=10,
-            cert_reqs='CERT_REQUIRED',
-            ca_certs=os.environ.get('SSL_CERT_FILE') or certifi.where(),
-            retries=urllib3.Retry(
-                total=5,
-                backoff_factor=0.2,
-                status_forcelist=[500, 502, 503, 504]
+        if self.proxy:
+            # NOTE: 'urllib.parse.urlparse' will return different result in Python3.9-3.10.
+            #       we use 'parse_url' to substitute for it.
+            # proxy_netloc = None
+            # ret = urllib.parse.urlparse(self.proxy)
+            # if ret.scheme:
+            #     proxy_netloc = ret.netloc
+            # else:
+            #     proxy_netloc = ret.path
+            url_obj = parse_url(self.proxy)
+            proxy_scheme = url_obj.scheme or "http"
+            proxy_host = url_obj.host or "127.0.0.1"
+            proxy_port = url_obj.port or 80
+            proxy_url = proxy_scheme + "://" + \
+                proxy_host + ":" + str(proxy_port)
+
+            self._s3_client = urllib3.ProxyManager(
+                proxy_url=proxy_url,
+                timeout=urllib3.util.Timeout(connect=timeout, read=timeout),
+                maxsize=10,
+                cert_reqs="CERT_REQUIRED",
+                ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+                retries=urllib3.Retry(
+                    total=4,
+                    backoff_factor=0.2,
+                    status_forcelist=[500, 502, 503, 504]
+                )
             )
-        )
+        else:
+            self._s3_client = urllib3.PoolManager(
+                timeout=urllib3.util.Timeout(connect=timeout, read=timeout),
+                maxsize=10,
+                cert_reqs="CERT_REQUIRED",
+                ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+                retries=urllib3.Retry(
+                    total=4,
+                    backoff_factor=0.2,
+                    status_forcelist=[500, 502, 503, 504]
+                )
+            )
 
     def _is_s3_expired(self):
         expiration = self._s3_credentials.get("Expiration")
@@ -1071,8 +1319,58 @@ class Api(object):
         return dt_expiration < datetime.now(pytz.utc)
 
     def _s3_upload(self, object_name, path):
+        """
+        Do not contain '\\' or '//' in object name, that will cause MaxRetryError.
+
+        Args:
+            object_name (str): url stored on oss server.
+            path (str): file path.
+
+        Returns:
+            urllib3.response.HTTPResponse: _description_
+        """
+        if re.search(r"(:|\\|/{2,})", object_name):
+            raise Exception("Do not include ':', '\\' or '//' in object name.")
+
         with open(path, "rb") as file_object:
             return self._s3_request("PUT", object_name, file_object, preload_content=True)
+
+    def download_file(self, object_name, byte_array):
+        if byte_array is None:
+            raise ValueError(
+                "byte_array should be QByteArray or bytearray object.")
+
+        object_name = object_name or ""
+
+        if object_name.startswith("/media") or object_name.startswith("/static"):
+            request = urllib.request.Request(
+                urllib.parse.urljoin(self.site_url, object_name))
+            response = urllib.request.urlopen(request)
+            data = response.read()
+
+            if isinstance(byte_array, bytearray):
+                byte_array += bytearray(data)
+            else:
+                byte_array.append(data)
+
+            response.close()
+        else:
+            try:
+                self.enable_s3()
+            except:
+                raise
+
+            response = self._s3_request(
+                "GET", object_name, preload_content=False)
+            for data in response.stream(amt=1024*1024):
+
+                if isinstance(byte_array, bytearray):
+                    byte_array += bytearray(data)
+                else:
+                    byte_array.append(data)
+
+            response.close()
+            response.release_conn()
 
     def _s3_download(self, object_name, path):
         with open(path, "ab") as file_object:
@@ -1093,12 +1391,26 @@ class Api(object):
         access_key = self._s3_credentials["AccessKeyId"]
         secret_key = self._s3_credentials["SecretAccessKey"]
 
+        # Limited in Python2:
+        # Uniform encoding of string that pass to 'request' method.
+        # To avoid the error below, here must encode given str.
+        # File "../httplib.py", line 812, in _send_output
+        # msg += message_body
+        # In Python3 this encode method will return bytes which is not what we expected.
+        if sys.version_info[0] < 3:
+            object_name = object_name and object_name.encode()
+
+        # path = f"/{bucket}/{object_name}"
+        path = "/%s/%s" % (bucket, object_name)
+
+        # NOTE: In Python2: Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
+        #                   Here I convert all argument to unicode string explicitly.
         url = urllib.parse.SplitResult(
             "https" if self._s3_credentials["Secure"] else "http",
             end_point,
-            f'/{bucket}/{object_name}',
-            '',
-            ''
+            path,
+            "",
+            ""
         )
 
         """Build headers with given parameters."""
@@ -1126,7 +1438,9 @@ class Api(object):
         headers["x-amz-date"] = _to_amz_date(date)
 
         """Do signature V4 of given request for given service name."""
-        scope = f"{_to_signer_date(date)}/{region}/{service_name}/aws4_request"
+        # scope = f"{_to_signer_date(date)}/{region}/{service_name}/aws4_request"
+        scope = "%s/%s/%s/aws4_request" % (_to_signer_date(date),
+                                           region, service_name)
 
         """Get canonical headers."""
         canonical_headers = {}
@@ -1145,25 +1459,31 @@ class Api(object):
         canonical_headers = OrderedDict(sorted(canonical_headers.items()))
         signed_headers = ";".join(canonical_headers.keys())
         canonical_headers = "\n".join(
-            [f"{key}:{value}" for key, value in canonical_headers.items()],
+            # [f"{key}:{value}" for key, value in canonical_headers.items()],
+            ["%s:%s" % (key, value)
+             for key, value in canonical_headers.items()],
         )
         canonical_query_string = ""
         content_sha256 = sha256
-        canonical_request = (
-            f"{method}\n"
-            f"{url.path}\n"
-            f"{canonical_query_string}\n"
-            f"{canonical_headers}\n\n"
-            f"{signed_headers}\n"
-            f"{content_sha256}"
-        )
+        # canonical_request = (
+        #     f"{method}\n"
+        #     f"{url.path}\n"
+        #     f"{canonical_query_string}\n"
+        #     f"{canonical_headers}\n\n"
+        #     f"{signed_headers}\n"
+        #     f"{content_sha256}"
+        # )
+        canonical_request = "%s\n%s\n%s\n%s\n\n%s\n%s" % (
+            method, url.path, canonical_query_string, canonical_headers, signed_headers, content_sha256)
 
         canonical_request_hash = _sha256_hash(canonical_request)
 
-        string_to_sign = (
-            f"AWS4-HMAC-SHA256\n{_to_amz_date(date)}\n{scope}\n"
-            f"{canonical_request_hash}"
-        )
+        # string_to_sign = (
+        #     f"AWS4-HMAC-SHA256\n{_to_amz_date(date)}\n{scope}\n"
+        #     f"{canonical_request_hash}"
+        # )
+        string_to_sign = "AWS4-HMAC-SHA256\n%s\n%s\n%s" % (
+            _to_amz_date(date), scope, canonical_request_hash)
 
         """Get signing key."""
         date_key = _hmac_hash(
@@ -1180,10 +1500,12 @@ class Api(object):
         signature = _hmac_hash(
             signing_key, string_to_sign.encode(), hexdigest=True)
 
-        authorization = (
-            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
-            f"SignedHeaders={signed_headers}, Signature={signature}"
-        )
+        # authorization = (
+        #     f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        #     f"SignedHeaders={signed_headers}, Signature={signature}"
+        # )
+        authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
+            access_key, scope, signed_headers, signature)
 
         headers["Authorization"] = authorization
 
@@ -1194,9 +1516,9 @@ class Api(object):
             else:
                 http_headers.add(key, value)
 
-        return self._s3_client.urlopen(
+        return self._s3_client.request(
             method,
-            urlunsplit(url),
+            urllib.parse.urlunsplit(url),
             body=body,
             headers=http_headers,
             preload_content=preload_content,

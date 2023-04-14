@@ -152,6 +152,9 @@ NOTE: given id comes from 'create' example.
 client.delete("Task", data=[{"id": 37}])
 
 
+client.find_project({"id":1, "type":"Shot"})
+
+
 """
 Example for async request.
 """

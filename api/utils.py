@@ -1,4 +1,4 @@
-# Licensed under the Apache License, Version 2.0 (the "License");
+# # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -10,21 +10,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from future.utils import raise_from
 
+import sys
 import urllib
 import pytz
 import hashlib
 import base64
 import hmac
 
-from datetime import datetime, timezone
+
+from datetime import datetime
+
+
+if sys.version_info[0] > 2:
+    from datetime import timezone
+else:
+    from pytz import timezone, utc
+    timezone.utc = utc
+
+
+def patch():
+    # 1. Add more urllib function.
+    from six import _importer, MovedAttribute, Module_six_moves_urllib_parse
+
+    attr = MovedAttribute("splitport", "urllib", "urllib.parse")
+    setattr(Module_six_moves_urllib_parse, attr.name, attr)
+    Module_six_moves_urllib_parse._moved_attributes.append(attr)
+
+    _importer._add_module(Module_six_moves_urllib_parse("six.moves.urllib_parse"),
+                          "moves.urllib_parse", "moves.urllib.parse")
+
+    if sys.version_info[0] > 2:
+        pass
+    else:
+        pass
 
 
 def _parse_iso8601_string(value):
-    """turns ISO 8601 string into datetime object"""
+    """turns ISO 8601 string into datetime object."""
     ISO8601_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f")
 
     value = value.rstrip("Z")
+
+    # Python interpreter will raise "AttributeError: _strptime" in multiple thread.
+    # Import _strptime explicitly will solve problem.
+    import _strptime
 
     for format_str in ISO8601_FORMATS:
         try:
@@ -48,7 +79,12 @@ def _md5sum_hash(data):
         return None
 
     hasher = hashlib.md5()
-    hasher.update(data.encode() if isinstance(data, str) else data)
+    try:
+        # DEBUG: UnicodeDecodeError: 'utf8' codec can't decode byte 0xd1 in position 27: invalid continuation byte.
+        string = data.encode() if isinstance(data, str) else data
+    except:
+        string = data
+    hasher.update(string)
     md5sum = base64.b64encode(hasher.digest())
     return md5sum.decode() if isinstance(md5sum, bytes) else md5sum
 
@@ -57,7 +93,12 @@ def _sha256_hash(data):
     """Compute SHA-256 of data and return hash as hex encoded value."""
     data = data or b""
     hasher = hashlib.sha256()
-    hasher.update(data.encode() if isinstance(data, str) else data)
+    try:
+        # DEBUG: UnicodeDecodeError: 'utf8' codec can't decode byte 0xd1 in position 27: invalid continuation byte.
+        string = data.encode() if isinstance(data, str) else data
+    except:
+        string = data
+    hasher.update(string)
     sha256sum = hasher.hexdigest()
     return sha256sum.decode() if isinstance(sha256sum, bytes) else sha256sum
 
@@ -103,12 +144,19 @@ def _guess_user_metadata(key):
 
 def _normalize_headers(headers):
     """Normalize headers by prefixing 'X-Amz-Meta-' for user metadata."""
-    headers = {str(key): value for key, value in (headers or {}).items()}
+    # headers = {str(key): value for key, value in (headers or {}).items()}
+    headers = {}
+    for key, value in (headers or {}).items():
+        headers[str(key)] = value
 
-    user_metadata = {
-        key: value for key, value in headers.items()
-        if _guess_user_metadata(key)
-    }
+    # user_metadata = {
+    #     key: value for key, value in headers.items()
+    #     if _guess_user_metadata(key)
+    # }
+    user_metadata = {}
+    for key, value in headers.items():
+        if _guess_user_metadata(key):
+            user_metadata[key] = value
 
     # Remove guessed user metadata.
     _ = [headers.pop(key) for key in user_metadata]
@@ -162,10 +210,12 @@ def _to_string(value):
     try:
         value.encode("us-ascii")
     except UnicodeEncodeError as exc:
-        raise ValueError(
-            f"unsupported metadata value {value}; "
-            f"only US-ASCII encoded characters are supported"
-        ) from exc
+        # raise ValueError(
+        #     f"unsupported metadata value {value}; "
+        #     f"only US-ASCII encoded characters are supported"
+        # ) from exc
+        raise_from(ValueError(
+            "unsupported metadata value %s; only US-ASCII encoded characters are supported" % value), exc)
     return value
 
 
@@ -178,10 +228,14 @@ def _normalize_value(values):
 def _metadata_to_headers(metadata):
     """Convert user metadata to headers."""
 
-    return {
-        _normalize_key(key): _normalize_value(value)
-        for key, value in (metadata or {}).items()
-    }
+    # return {
+    #     _normalize_key(key): _normalize_value(value)
+    #     for key, value in (metadata or {}).items()
+    # }
+    _ = {}
+    for key, value in (metadata or {}).items():
+        _[_normalize_key(key)] = _normalize_value(value)
+    return _
 
 
 def _quote(resource, safe='/', encoding=None, errors=None):
