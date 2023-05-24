@@ -105,7 +105,6 @@ def _sha256_hash(data):
 
 def _hmac_hash(key, data, hexdigest=False):
     """Return HMacSHA256 digest of given key and data."""
-
     hasher = hmac.new(key, data, hashlib.sha256)
     return hasher.hexdigest() if hexdigest else hasher.digest()
 

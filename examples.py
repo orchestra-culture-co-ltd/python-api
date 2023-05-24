@@ -2,19 +2,24 @@ from api import Api
 
 
 base_url = "https://trial.orchestra-technology.com"
+test_email = ""
+test_password = ""
+
+api_email = ""
+api_key = ""
 
 
 """
 Example for login method.
 """
-client = Api(base_url, "test@orchestra-technology.com", "test@123")
+client = Api(base_url, test_email, test_password)
 client.login()
 
 
 """
 Example for login with api user.
 """
-client = Api(base_url, "api_user@orchestra-technology.com", api_key="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+client = Api(base_url, api_email, api_key=api_key)
 client.login()
 
 

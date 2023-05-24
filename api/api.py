@@ -36,6 +36,8 @@ from .utils import (
     _generate_headers,
 )
 
+
+urllib3.disable_warnings()
 patch()
 
 
@@ -49,7 +51,7 @@ else:
     urllib_support_method = False
 
 
-__VERSION__ = "0.0.4"
+__VERSION__ = "0.0.5"
 
 
 REQUEST_TIMEOUT = 10
@@ -229,6 +231,11 @@ class Api(object):
 
     def get_ack_url(self):
         return urllib.parse.urljoin(self.site_url, "/cloud/ack")
+
+    def get_action_url(self, action):
+        if action in ["read", "follow", "favor"]:
+            return urllib.parse.urljoin(self.site_url, "/action/%s" % action)
+        raise Exception("Unaccepted action.")
 
     # GET CSRFTOKEN.
     def cache_csrftoken(self):
@@ -803,6 +810,22 @@ class Api(object):
         request = self._build_async_task_request(data)
         response = self._polling_http_request(request)
         return self._process_async_task_response(response)
+
+    def action(self, action_name, entity_id, entity_type):
+        url = self.get_action_url(action_name)
+
+        kwargs = {}
+        if urllib_support_method:
+            kwargs["method"] = "POST"
+
+        payload_encoded = self.encode_payload(
+            {"entity": json.dumps({"id": entity_id, "type": entity_type})})
+
+        request = urllib.request.Request(url, data=payload_encoded, **kwargs)
+        self.add_x_csrftoken_header(request)
+        self.add_general_header(request)
+        response = self._http_request(request)
+        return self.decode_payload(response)
 
     def build_payload(self, request_type, entity_type, fields, data):
         payload = {
