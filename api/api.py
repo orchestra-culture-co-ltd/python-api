@@ -295,7 +295,7 @@ class Api(object):
 
         return self._send_authenticate_request(request)
 
-    def log_out(self):
+    def logout(self):
         """
         Log out.
         """
@@ -1210,7 +1210,12 @@ class Api(object):
         """
         try:
             self.enable_s3()
-            self._s3_upload(url, path)
+            response = self._s3_upload(url, path)
+
+            if response.status != 200:
+                raise urllib.error.HTTPError(response.geturl(
+                ), response.status, response.reason, response.getheaders(), response)
+
         except:
             raise
 
@@ -1385,6 +1390,10 @@ class Api(object):
 
             response = self._s3_request(
                 "GET", object_name, preload_content=False)
+            if response.status != 200:
+                raise urllib.error.HTTPError(response.geturl(
+                ), response.status, response.reason, response.getheaders(), response)
+
             for data in response.stream(amt=1024*1024):
 
                 if isinstance(byte_array, bytearray):
@@ -1399,6 +1408,11 @@ class Api(object):
         with open(path, "ab") as file_object:
             response = self._s3_request(
                 "GET", object_name, preload_content=False)
+
+            if response.status != 200:
+                raise urllib.error.HTTPError(response.geturl(
+                ), response.status, response.reason, response.getheaders(), response)
+
             for data in response.stream(amt=1024*1024):
                 file_object.write(data)
 
