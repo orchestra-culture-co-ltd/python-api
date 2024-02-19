@@ -1250,7 +1250,8 @@ class Api(object):
             self._get_s3_security_token()
 
     def _get_s3_security_token(self):
-        """[summary]
+        """
+        Prepare S3 security token.
 
         :returns    : credential dictionary.
         """
@@ -1560,3 +1561,149 @@ class Api(object):
             headers=http_headers,
             preload_content=preload_content,
         )
+
+    def event_stream(self, callback=None, filters=None, interval=None):
+        """
+        Start a long polling request to get latest event log entries.
+
+        Args:
+            callback (function): receive two parameters include api object and message.
+            filters (dict): additional filter condition.
+            interval (int): specify a polling interval.
+
+        Returns:
+            urllib3.response.HTTPResponse: _description_
+        """
+        client = urllib3.PoolManager(
+            timeout=urllib3.util.Timeout(connect=timedelta(
+                minutes=1).seconds, read=timedelta(minutes=1).seconds),
+            maxsize=10,
+            cert_reqs="CERT_REQUIRED",
+            ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+            retries=urllib3.Retry(
+                total=4,
+                backoff_factor=0.2,
+                status_forcelist=[500, 502, 503, 504]
+            )
+        )
+
+        headers = {}
+        USER_AGENTS = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0", ]
+        cookie = ""
+        cookiejar = self.find_cookiejar()
+        if cookiejar is not None:
+            for item in cookiejar:
+                cookie += "%s=%s;" % (item.name, item.value)
+
+                if item.name == CSRF_TOKEN_NAME:
+                    headers[X_CSRFTOKEN_NAME] = item.value
+
+        headers["Cookie"] = cookie
+        headers["user-agent"] = "; ".join(USER_AGENTS)
+        headers["Accept"] = "*/*"
+        headers["Accept-Encoding"] = "gzip, deflate"
+        headers["Accept-Language"] = "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"
+        headers["Content-Type"] = "text/event-stream"
+        headers["Cache-Control"] = "no-cache"
+        headers["Connection"] = "keep-alive"
+        headers["Sec-Fetch-Dest"] = "empty"
+        headers["Sec-Fetch-Mode"] = "cors"
+        headers["Sec-Fetch-Site"] = "same-origin"
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Referer"] = self.site_url
+
+        http_headers = HTTPHeaderDict()
+        for key, value in (headers or {}).items():
+            if isinstance(value, (list, tuple)):
+                _ = [http_headers.add(key, val) for val in value]
+            else:
+                http_headers.add(key, value)
+
+        # Generate json data.
+        params = {}
+        if interval is not None:
+            params["interval"] = interval
+        if filters is not None:
+            params["filters"] = filters
+
+        # Do request.
+        response = client.request(
+            "POST",
+            urllib.parse.urljoin(self.site_url, "sse/event_log_entry"),
+            body=json.dumps(params).encode(),
+            headers=http_headers,
+            preload_content=False,
+            encode_multipart=False
+        )
+
+        def generate():
+            while True:
+                if hasattr(response, "_fp") and \
+                        hasattr(response._fp, "fp") and \
+                        hasattr(response._fp.fp, "read1"):
+                    chunk = response._fp.fp.read1(1024)
+                else:
+                    chunk = response.read(1024)
+                if not chunk:
+                    break
+                yield chunk
+
+        iterator = generate()
+        buff = b""
+
+        sse_line_pattern = re.compile(b"(?P<name>[^:]*):?( ?(?P<value>.*))?")
+        end_tag = re.compile(br"\r\n\r\n|\r\r|\n\n")
+
+        # Start Listener.
+        while True:
+            if re.search(end_tag, buff) is None:
+                try:
+                    next_chunk = next(iterator)
+                    if not next_chunk:
+                        raise EOFError()
+                    buff += next_chunk
+                except Exception as e:
+                    raise e
+            else:
+                msg = {}
+                for line in buff.splitlines():
+                    m = sse_line_pattern.match(line)
+                    if m is None:
+                        __LOG__.warning("Invalid SSE line: \"%s\"" %
+                                        line, SyntaxWarning)
+                        continue
+                    else:
+                        name = m.group("name")
+                        if not name:
+                            continue
+
+                        value = m.group("value")
+                        if value:
+                            value = value.decode()
+
+                        if name == b"data":
+                            if "data" in msg:
+                                msg["data"] = "%s\n%s" % (msg["data"], value)
+                            else:
+                                msg["data"] = value
+
+                        elif name == b"event":
+                            msg["event"] = value
+
+                        elif name == b"id":
+                            msg["id"] = value
+
+                        elif name == b"retry":
+                            msg["retry"] = int(value)
+
+                if callback:
+                    try:
+                        msg["data"] = json.loads(msg["data"])
+                    except:
+                        pass
+
+                    callback(self, msg)
+
+                # Rest
+                buff = b""
