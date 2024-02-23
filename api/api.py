@@ -51,7 +51,7 @@ else:
     urllib_support_method = False
 
 
-__VERSION__ = "0.0.5"
+__VERSION__ = "0.0.6"
 
 
 REQUEST_TIMEOUT = 10
@@ -1298,6 +1298,9 @@ class Api(object):
             self._s3_credentials["Expiration"] = data["ack"]["Expiration"].encode(
             )
 
+        self._s3_client = self._create_client()
+
+    def _create_client(self):
         timeout = timedelta(minutes=1).seconds
         if self.proxy:
             # NOTE: 'urllib.parse.urlparse' will return different result in Python3.9-3.10.
@@ -1315,7 +1318,7 @@ class Api(object):
             proxy_url = proxy_scheme + "://" + \
                 proxy_host + ":" + str(proxy_port)
 
-            self._s3_client = urllib3.ProxyManager(
+            return urllib3.ProxyManager(
                 proxy_url=proxy_url,
                 timeout=urllib3.util.Timeout(connect=timeout, read=timeout),
                 maxsize=10,
@@ -1328,7 +1331,7 @@ class Api(object):
                 )
             )
         else:
-            self._s3_client = urllib3.PoolManager(
+            return urllib3.PoolManager(
                 timeout=urllib3.util.Timeout(connect=timeout, read=timeout),
                 maxsize=10,
                 cert_reqs="CERT_REQUIRED",
@@ -1566,26 +1569,13 @@ class Api(object):
         """
         Start a long polling request to get latest event log entries.
 
-        Args:
-            callback (function): receive two parameters include api object and message.
-            filters (dict): additional filter condition.
-            interval (int): specify a polling interval.
+        :param callback    : receive two parameters include api object and message.
+        :param filters     : additional filter condition like ["project", "is", {"id": 1, "type": "Project"}]
+        :param interval    : specify a polling interval.
 
-        Returns:
-            urllib3.response.HTTPResponse: _description_
+        :returns           :  
         """
-        client = urllib3.PoolManager(
-            timeout=urllib3.util.Timeout(connect=timedelta(
-                minutes=1).seconds, read=timedelta(minutes=1).seconds),
-            maxsize=10,
-            cert_reqs="CERT_REQUIRED",
-            ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
-            retries=urllib3.Retry(
-                total=4,
-                backoff_factor=0.2,
-                status_forcelist=[500, 502, 503, 504]
-            )
-        )
+        client = self._create_client()
 
         headers = {}
         USER_AGENTS = [
@@ -1625,7 +1615,7 @@ class Api(object):
         if interval is not None:
             params["interval"] = interval
         if filters is not None:
-            params["filters"] = filters
+            params["filters"] = self.process_filters(filters)
 
         # Do request.
         response = client.request(

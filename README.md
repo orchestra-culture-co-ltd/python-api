@@ -1,9 +1,9 @@
-## GOAL
+### GOAL
 We supply Python API for accessing Orchestra Pipeline System so that you can integrate it with your tools.  
 
 
 
-## INSTALL DEPENDENCIES
+### INSTALL DEPENDENCIES
 ```
 pip install --upgrade pip
 or
@@ -13,7 +13,7 @@ pip install certifi pytz future six pyyaml typing urllib3==1.26
 ```
 
 
-## EXAMPLE
+### EXAMPLE
 ```
 from api import Api
 
