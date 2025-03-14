@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2019-2023, 北京遨奇思特文化有限责任公司, alternate name Orchestra Culture Co., ltd. All rights reserved.
+# Copyright (c) 2019-2025, 北京遨奇思特文化有限责任公司, alternate name Orchestra Culture Co., ltd. All rights reserved.
 
 import sys
 import os
@@ -1185,7 +1185,7 @@ class Api(object):
                     "This request should be failed, maybe server get confused.")
             else:
                 raise exceptions.RequestFailed(
-                    "ERROR: " + payload.get("message", {}).get("detail"))
+                    "ERROR: " + payload.get("message", {}).get("detail", str(payload)))
         raise exceptions.UnknownError(
             "Should has failed detail but payload is empty.")
 
@@ -1282,8 +1282,10 @@ class Api(object):
             # utc time.
             self._s3_credentials["Expiration"] = data["ack"]["Expiration"]
         else:
-            # NOTE: In Python2: Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
-            #                   Here I convert all argument to utf8 string explicitly.
+            # NOTE:
+            # In Python2:
+            # Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
+            # Here I convert all argument to utf8 string explicitly.
             self._s3_credentials["EndPoint"] = data["EndPoint"].encode()
             self._s3_credentials["Secure"] = data["Secure"]
             self._s3_credentials["Bucket"] = data["Bucket"].encode()
@@ -1303,14 +1305,10 @@ class Api(object):
     def _create_client(self):
         timeout = timedelta(minutes=1).seconds
         if self.proxy:
-            # NOTE: 'urllib.parse.urlparse' will return different result in Python3.9-3.10.
-            #       we use 'parse_url' to substitute for it.
-            # proxy_netloc = None
+            # NOTE:
+            # 'urllib.parse.urlparse' will return different result in Python3.9-3.10.
+            # we use 'parse_url' to substitute for it.
             # ret = urllib.parse.urlparse(self.proxy)
-            # if ret.scheme:
-            #     proxy_netloc = ret.netloc
-            # else:
-            #     proxy_netloc = ret.path
             url_obj = parse_url(self.proxy)
             proxy_scheme = url_obj.scheme or "http"
             proxy_host = url_obj.host or "127.0.0.1"
@@ -1367,46 +1365,64 @@ class Api(object):
         with open(path, "rb") as file_object:
             return self._s3_request("PUT", object_name, file_object, preload_content=True)
 
-    def download_file(self, object_name, byte_array):
+    def download_byte_array(self, object_name, byte_array):
         if byte_array is None:
             raise ValueError(
                 "byte_array should be QByteArray or bytearray object.")
 
+        try:
+            self.enable_s3()
+        except:
+            raise
+
         object_name = object_name or ""
 
         if object_name.startswith("/media") or object_name.startswith("/static"):
-            request = urllib.request.Request(
-                urllib.parse.urljoin(self.site_url, object_name))
-            response = urllib.request.urlopen(request)
-            data = response.read()
+            response = self._s3_client.request(
+                "GET", urllib.parse.urljoin(self.site_url, object_name), preload_content=False)
+        else:
+            response = self._s3_request(
+                "GET", object_name, preload_content=False)
+
+        if response.status != 200:
+            raise urllib.error.HTTPError(response.geturl(
+            ), response.status, response.reason, response.getheaders(), response)
+
+        for data in response.stream(amt=1024*1024):
 
             if isinstance(byte_array, bytearray):
                 byte_array += bytearray(data)
             else:
                 byte_array.append(data)
 
-            response.close()
-        else:
-            try:
-                self.enable_s3()
-            except:
-                raise
+        response.close()
+        response.release_conn()
 
+    def download_file(self, object_name, path):
+        try:
+            self.enable_s3()
+        except:
+            raise
+
+        object_name = object_name or ""
+
+        if object_name.startswith("/media") or object_name.startswith("/static"):
+            response = self._s3_client.request(
+                "GET", urllib.parse.urljoin(self.site_url, object_name), preload_content=False)
+        else:
             response = self._s3_request(
                 "GET", object_name, preload_content=False)
-            if response.status != 200:
-                raise urllib.error.HTTPError(response.geturl(
-                ), response.status, response.reason, response.getheaders(), response)
 
+        if response.status != 200:
+            raise urllib.error.HTTPError(response.geturl(
+            ), response.status, response.reason, response.getheaders(), response)
+
+        with open(path, "ab") as file_object:
             for data in response.stream(amt=1024*1024):
+                file_object.write(data)
 
-                if isinstance(byte_array, bytearray):
-                    byte_array += bytearray(data)
-                else:
-                    byte_array.append(data)
-
-            response.close()
-            response.release_conn()
+        response.close()
+        response.release_conn()
 
     def _s3_download(self, object_name, path):
         with open(path, "ab") as file_object:
@@ -1432,7 +1448,8 @@ class Api(object):
         access_key = self._s3_credentials["AccessKeyId"]
         secret_key = self._s3_credentials["SecretAccessKey"]
 
-        # Limited in Python2:
+        # NOTE:
+        # In Python2:
         # Uniform encoding of string that pass to 'request' method.
         # To avoid the error below, here must encode given str.
         # File "../httplib.py", line 812, in _send_output
@@ -1441,11 +1458,12 @@ class Api(object):
         if sys.version_info[0] < 3:
             object_name = object_name and object_name.encode()
 
-        # path = f"/{bucket}/{object_name}"
         path = "/%s/%s" % (bucket, object_name)
 
-        # NOTE: In Python2: Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
-        #                   Here I convert all argument to unicode string explicitly.
+        # NOTE:
+        # In Python2:
+        # Keep all arguments' type are same or 'urlunsplit' function will raise 'Cannot mix str and non-str arguments'.
+        # Here I convert all argument to unicode string explicitly.
         url = urllib.parse.SplitResult(
             "https" if self._s3_credentials["Secure"] else "http",
             end_point,
@@ -1478,12 +1496,11 @@ class Api(object):
         date = datetime.utcnow().replace(tzinfo=timezone.utc)
         headers["x-amz-date"] = _to_amz_date(date)
 
-        """Do signature V4 of given request for given service name."""
-        # scope = f"{_to_signer_date(date)}/{region}/{service_name}/aws4_request"
+        # Do signature V4 of given request for given service name.
         scope = "%s/%s/%s/aws4_request" % (_to_signer_date(date),
                                            region, service_name)
 
-        """Get canonical headers."""
+        # Get canonical headers.
         canonical_headers = {}
         for key, values in headers.items():
             key = key.lower()
@@ -1500,33 +1517,20 @@ class Api(object):
         canonical_headers = OrderedDict(sorted(canonical_headers.items()))
         signed_headers = ";".join(canonical_headers.keys())
         canonical_headers = "\n".join(
-            # [f"{key}:{value}" for key, value in canonical_headers.items()],
             ["%s:%s" % (key, value)
              for key, value in canonical_headers.items()],
         )
         canonical_query_string = ""
         content_sha256 = sha256
-        # canonical_request = (
-        #     f"{method}\n"
-        #     f"{url.path}\n"
-        #     f"{canonical_query_string}\n"
-        #     f"{canonical_headers}\n\n"
-        #     f"{signed_headers}\n"
-        #     f"{content_sha256}"
-        # )
         canonical_request = "%s\n%s\n%s\n%s\n\n%s\n%s" % (
             method, url.path, canonical_query_string, canonical_headers, signed_headers, content_sha256)
 
         canonical_request_hash = _sha256_hash(canonical_request)
 
-        # string_to_sign = (
-        #     f"AWS4-HMAC-SHA256\n{_to_amz_date(date)}\n{scope}\n"
-        #     f"{canonical_request_hash}"
-        # )
         string_to_sign = "AWS4-HMAC-SHA256\n%s\n%s\n%s" % (
             _to_amz_date(date), scope, canonical_request_hash)
 
-        """Get signing key."""
+        # Get signing key.
         date_key = _hmac_hash(
             ("AWS4" + secret_key).encode(),
             _to_signer_date(date).encode(),
@@ -1537,14 +1541,10 @@ class Api(object):
         )
         signing_key = _hmac_hash(date_region_service_key, b"aws4_request")
 
-        """Get signature."""
+        # Get signature.
         signature = _hmac_hash(
             signing_key, string_to_sign.encode(), hexdigest=True)
 
-        # authorization = (
-        #     f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
-        #     f"SignedHeaders={signed_headers}, Signature={signature}"
-        # )
         authorization = "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
             access_key, scope, signed_headers, signature)
 
